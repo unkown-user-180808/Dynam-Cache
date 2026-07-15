@@ -18,7 +18,7 @@ from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
-# Apply JSON numpy patch for serialization
+
 json_numpy.patch()
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
@@ -28,30 +28,56 @@ from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActio
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
-    ACTION_DIM,
-    ACTION_PROPRIO_NORMALIZATION_TYPE,
+ACTION_DIM,
+ACTION_PROPRIO_NORMALIZATION_TYPE,
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
-# Initialize important constants
+from experiments.robot.libero.attention_utils import (
+token_attention_merge,
+spatial_scores_to_map,
+update_attention_ema,
+get_content_word_row_groups,
+token_attention_merge_word_groups,
+)
+
+
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-OPENVLA_IMAGE_SIZE = 224  # Standard image size expected by OpenVLA
+OPENVLA_IMAGE_SIZE = 224
 
-# Configure NumPy print settings
+
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
 
+def clean_attentions(attns):
+    if attns is None:
+        return None
+
+    if torch.is_tensor(attns):
+        if attns.dim() == 4 and torch.is_floating_point(attns):
+            return (attns,)
+        return None
+
+    cleaned = []
+    has_valid = False
+
+    for x in attns:
+        if torch.is_tensor(x) and x.dim() == 4 and torch.is_floating_point(x):
+            cleaned.append(x)
+            has_valid = True
+        else:
+            cleaned.append(None)
+
+    return tuple(cleaned) if has_valid else None
 
 def model_is_on_hf_hub(model_path: str) -> bool:
     """Checks whether a model path points to a model on Hugging Face Hub."""
-    # If the API call below runs without error, the model is on the hub
     try:
         HfApi().model_info(model_path)
         return True
     except Exception:
         return False
-
 
 def update_auto_map(pretrained_checkpoint: str) -> None:
     """
@@ -71,13 +97,11 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
         print(f"Warning: No config.json found at {config_path}")
         return
 
-    # Create timestamped backup
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = os.path.join(pretrained_checkpoint, f"config.json.back.{timestamp}")
     shutil.copy2(config_path, backup_path)
     print(f"Created backup of original config at: {os.path.abspath(backup_path)}")
 
-    # Read and update the config
     with open(config_path, "r") as f:
         config = json.load(f)
 
@@ -86,7 +110,6 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
         "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
     }
 
-    # Write back the updated config
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
@@ -109,17 +132,16 @@ def check_identical_files(path1: Union[str, Path], path2: Union[str, Path]) -> b
     """
     path1, path2 = Path(path1), Path(path2)
 
-    # First check if file sizes match
     if path1.stat().st_size != path2.stat().st_size:
         return False
 
-    # Check if contents match
     return filecmp.cmp(path1, path2, shallow=False)
 
 
 def _handle_file_sync(curr_filepath: str, checkpoint_filepath: str, file_type: str) -> None:
     """
     Handle syncing of files between current directory and checkpoint.
+
 
     Creates backups if files exist but differ, and copies current versions to checkpoint.
 
@@ -129,7 +151,6 @@ def _handle_file_sync(curr_filepath: str, checkpoint_filepath: str, file_type: s
         file_type: Description of the file type for logging
     """
     if os.path.exists(checkpoint_filepath):
-        # Check if existing files are identical
         match = check_identical_files(curr_filepath, checkpoint_filepath)
 
         if not match:
@@ -140,13 +161,11 @@ def _handle_file_sync(curr_filepath: str, checkpoint_filepath: str, file_type: s
                 f"Checkpoint: {checkpoint_filepath}\n"
             )
 
-            # Create timestamped backup
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = f"{checkpoint_filepath}.back.{timestamp}"
             shutil.copy2(checkpoint_filepath, backup_path)
             print(f"Created backup of original checkpoint file at: {os.path.abspath(backup_path)}")
 
-            # Copy current version to checkpoint directory
             shutil.copy2(curr_filepath, checkpoint_filepath)
             print(f"Copied current version to checkpoint at: {os.path.abspath(checkpoint_filepath)}")
             print(
@@ -154,7 +173,6 @@ def _handle_file_sync(curr_filepath: str, checkpoint_filepath: str, file_type: s
                 "\n------------------------------------------------------------------------------------------------\n"
             )
     else:
-        # If file doesn't exist in checkpoint directory, copy it
         shutil.copy2(curr_filepath, checkpoint_filepath)
         print(
             "\n------------------------------------------------------------------------------------------------\n"
@@ -169,6 +187,7 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     """
     Check and sync model logic files between current code and checkpoint.
 
+
     Handles the relationship between current and checkpoint versions of both
     modeling_prismatic.py and configuration_prismatic.py:
     - If checkpoint file exists and differs: creates backup and copies current version
@@ -180,7 +199,6 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
     if not os.path.isdir(pretrained_checkpoint):
         return
 
-    # Find current files
     curr_files = {"modeling_prismatic.py": None, "configuration_prismatic.py": None}
 
     for root, _, files in os.walk("./prismatic/"):
@@ -188,7 +206,6 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
             if filename in files and curr_files[filename] is None:
                 curr_files[filename] = os.path.join(root, filename)
 
-    # Check and handle each file
     for filename, curr_filepath in curr_files.items():
         if curr_filepath is None:
             print(f"WARNING: `{filename}` is not found anywhere in the current directory.")
@@ -226,10 +243,10 @@ def find_checkpoint_file(pretrained_checkpoint: str, file_pattern: str) -> str:
 
     return checkpoint_files[0]
 
-
 def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     """
     Load a component's state dict from checkpoint and handle DDP prefix if present.
+
 
     Args:
         checkpoint_path: Path to the checkpoint file
@@ -239,7 +256,6 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     """
     state_dict = torch.load(checkpoint_path, weights_only=True)
 
-    # If the component was trained with DDP, elements in the state dict have prefix "module." which we must remove
     new_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith("module."):
@@ -262,26 +278,17 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     """
     print("Instantiating pretrained VLA policy...")
 
-    # If loading a locally stored pretrained checkpoint, check whether config or model files
-    # need to be synced so that any changes the user makes to the VLA modeling code will
-    # actually go into effect
-    # If loading a pretrained checkpoint from Hugging Face Hub, we just assume that the policy
-    # will be used as is, with its original modeling logic
     if not model_is_on_hf_hub(cfg.pretrained_checkpoint):
-        # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-        # Update config.json and sync model files
         update_auto_map(cfg.pretrained_checkpoint)
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
-    # Load the model
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
-        # attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
@@ -289,20 +296,16 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         trust_remote_code=True,
     )
 
-    # If using FiLM, wrap the vision backbone to allow for infusion of language inputs
     if cfg.use_film:
         vla = _apply_film_to_vla(vla, cfg)
 
-    # Set number of images in model input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
     vla.eval()
 
-    # Move model to device if not using quantization
     if not cfg.load_in_8bit and not cfg.load_in_4bit:
         vla = vla.to(DEVICE)
 
-    # Load dataset stats for action normalization
     _load_dataset_stats(vla, cfg.pretrained_checkpoint)
 
     return vla
@@ -311,6 +314,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
 def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
     """
     Apply FiLM (Feature-wise Linear Modulation) to the VLA vision backbone.
+
 
     Args:
         vla: The VLA model
@@ -321,7 +325,6 @@ def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
     """
     from peft import LoraConfig, get_peft_model
 
-    # Apply LoRA configuration
     lora_config = LoraConfig(
         r=cfg.lora_rank,
         lora_alpha=min(cfg.lora_rank, 16),
@@ -331,18 +334,15 @@ def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
     )
     vla = get_peft_model(vla, lora_config)
 
-    # Create and apply FiLMed vision backbone
     new_vision_backbone = FiLMedPrismaticVisionBackbone(
         vision_backbone=vla.vision_backbone, llm_dim=vla.llm_dim,
     )
     vla.model.vision_backbone = new_vision_backbone
 
-    # Load vision backbone checkpoint
     checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vision_backbone")
     state_dict = torch.load(checkpoint_path, weights_only=True)
     vla.model.vision_backbone.load_state_dict(state_dict)
 
-    # Use the model component instead of wrapper and convert to bfloat16
     vla = vla.model
     vla.vision_backbone = vla.vision_backbone.to(torch.bfloat16)
 
@@ -353,12 +353,12 @@ def _load_dataset_stats(vla: torch.nn.Module, checkpoint_path: str) -> None:
     """
     Load dataset statistics used during training for action normalization.
 
+
     Args:
         vla: The VLA model
         checkpoint_path: Path to the checkpoint directory
     """
     if model_is_on_hf_hub(checkpoint_path):
-        # Download dataset stats directly from HF Hub
         dataset_statistics_path = hf_hub_download(
             repo_id=checkpoint_path,
             filename="dataset_statistics.json",
@@ -381,6 +381,7 @@ def get_processor(cfg: Any) -> AutoProcessor:
     """
     Get the VLA model's Hugging Face processor.
 
+
     Args:
         cfg: Configuration object with model parameters
 
@@ -388,7 +389,6 @@ def get_processor(cfg: Any) -> AutoProcessor:
         AutoProcessor: The model's processor
     """
     return AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
-
 
 def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioProjector:
     """
@@ -402,7 +402,6 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
     Returns:
         ProprioProjector: The initialized proprio projector
     """
-    # Initialize projector and move to device
     proprio_projector = ProprioProjector(
         llm_dim=llm_dim,
         proprio_dim=proprio_dim,
@@ -410,7 +409,6 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
     proprio_projector = proprio_projector.to(torch.bfloat16).to(DEVICE)
     proprio_projector.eval()
 
-    # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
     if model_is_on_hf_hub(cfg.pretrained_checkpoint):
         model_path_to_proprio_projector_name = {
             "moojink/openvla-7b-oft-finetuned-libero-spatial": "proprio_projector--150000_checkpoint.pt",
@@ -421,7 +419,6 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
         }
         if cfg.pretrained_checkpoint not in model_path_to_proprio_projector_name.keys():
             raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
-        # Download proprio projector directly from HF Hub
         proprio_projector_path = hf_hub_download(
             repo_id=cfg.pretrained_checkpoint, filename=model_path_to_proprio_projector_name[cfg.pretrained_checkpoint]
         )
@@ -446,20 +443,17 @@ def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     Returns:
         NoisyActionProjector: The initialized noisy action projector
     """
-    # Initialize projector and move to device
     noisy_action_projector = NoisyActionProjector(
         llm_dim=llm_dim,
     ).to(DEVICE)
     noisy_action_projector = noisy_action_projector.to(torch.bfloat16).to(DEVICE)
     noisy_action_projector.eval()
 
-    # Find and load checkpoint
     checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "noisy_action_projector")
     state_dict = load_component_state_dict(checkpoint_path)
     noisy_action_projector.load_state_dict(state_dict)
 
     return noisy_action_projector
-
 
 def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead]:
     """
@@ -477,14 +471,12 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     """
     assert not (cfg.use_l1_regression and cfg.use_diffusion), "Cannot use both L1 regression and diffusion action head!"
 
-    # Initialize appropriate action head based on configuration
     if cfg.use_l1_regression:
         action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     elif cfg.use_diffusion:
         action_head = DiffusionActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps_train=cfg.num_diffusion_steps_train
         )
-        # Set number of diffusion steps for inference
         action_head.noise_scheduler.set_timesteps(cfg.num_diffusion_steps_inference)
     else:
         raise ValueError("Either use_l1_regression or use_diffusion must be True")
@@ -492,7 +484,6 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     action_head = action_head.to(torch.bfloat16).to(DEVICE)
     action_head.eval()
 
-    # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
     if model_is_on_hf_hub(cfg.pretrained_checkpoint):
         model_path_to_action_head_name = {
             "moojink/openvla-7b-oft-finetuned-libero-spatial": "action_head--150000_checkpoint.pt",
@@ -503,7 +494,6 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         }
         if cfg.pretrained_checkpoint not in model_path_to_action_head_name.keys():
             raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
-        # Download proprio projector directly from HF Hub
         action_head_path = hf_hub_download(
             repo_id=cfg.pretrained_checkpoint, filename=model_path_to_action_head_name[cfg.pretrained_checkpoint]
         )
@@ -515,7 +505,6 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         action_head.load_state_dict(state_dict)
 
     return action_head
-
 
 def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, int]]) -> np.ndarray:
     """
@@ -534,14 +523,12 @@ def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, 
     if isinstance(resize_size, int):
         resize_size = (resize_size, resize_size)
 
-    # Resize using the same pipeline as in RLDS dataset builder
-    img = tf.image.encode_jpeg(img)  # Encode as JPEG
-    img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)  # Decode back
+    img = tf.image.encode_jpeg(img)
+    img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)
     img = tf.image.resize(img, resize_size, method="lanczos3", antialias=True)
     img = tf.cast(tf.clip_by_value(tf.round(img), 0, 255), tf.uint8)
 
     return img.numpy()
-
 
 def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.Tensor:
     """
@@ -557,18 +544,15 @@ def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.
     Returns:
         tf.Tensor: The cropped and resized image
     """
-    # Handle 3D inputs by adding batch dimension if needed
     assert image.shape.ndims in (3, 4), "Image must be 3D or 4D tensor"
     expanded_dims = False
     if image.shape.ndims == 3:
         image = tf.expand_dims(image, axis=0)
         expanded_dims = True
 
-    # Calculate crop dimensions (note: we use sqrt(crop_scale) for h/w)
     new_heights = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
     new_widths = tf.reshape(tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,))
 
-    # Create bounding box for the crop
     height_offsets = (1 - new_heights) / 2
     width_offsets = (1 - new_widths) / 2
     bounding_boxes = tf.stack(
@@ -581,17 +565,14 @@ def crop_and_resize(image: tf.Tensor, crop_scale: float, batch_size: int) -> tf.
         axis=1,
     )
 
-    # Apply crop and resize
     image = tf.image.crop_and_resize(
         image, bounding_boxes, tf.range(batch_size), (OPENVLA_IMAGE_SIZE, OPENVLA_IMAGE_SIZE)
     )
 
-    # Remove batch dimension if it was added
     if expanded_dims:
         image = image[0]
 
     return image
-
 
 def center_crop_image(image: Union[np.ndarray, Image.Image]) -> Image.Image:
     """
@@ -606,25 +587,19 @@ def center_crop_image(image: Union[np.ndarray, Image.Image]) -> Image.Image:
     batch_size = 1
     crop_scale = 0.9
 
-    # Convert to TF Tensor if needed
     if not isinstance(image, tf.Tensor):
         image = tf.convert_to_tensor(np.array(image))
 
     orig_dtype = image.dtype
 
-    # Convert to float32 in range [0,1]
     image = tf.image.convert_image_dtype(image, tf.float32)
 
-    # Apply center crop and resize
     image = crop_and_resize(image, crop_scale, batch_size)
 
-    # Convert back to original data type
     image = tf.clip_by_value(image, 0, 1)
     image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
 
-    # Convert to PIL Image
     return Image.fromarray(image.numpy()).convert("RGB")
-
 
 def check_image_format(image: Any) -> None:
     """
@@ -644,7 +619,6 @@ def check_image_format(image: Any) -> None:
         "Incorrect image format detected! Make sure that the input image is a "
         "numpy array with shape (H, W, 3) and dtype np.uint8!"
     )
-
 
 def normalize_proprio(proprio: np.ndarray, norm_stats: Dict[str, Any]) -> np.ndarray:
     """
@@ -693,17 +667,13 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     processed_images = []
 
     for image in images:
-        # Validate format
         check_image_format(image)
 
-        # Resize if needed
         if image.shape != (OPENVLA_IMAGE_SIZE, OPENVLA_IMAGE_SIZE, 3):
             image = resize_image_for_policy(image, OPENVLA_IMAGE_SIZE)
 
-        # Convert to PIL image
         pil_image = Image.fromarray(image).convert("RGB")
 
-        # Apply center crop if configured
         if cfg.center_crop:
             pil_image = center_crop_image(pil_image)
 
@@ -722,85 +692,209 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    last_caches: Optional[dict] = None,
+    warped_cache=None,
 ) -> List[np.ndarray]:
-    """
-    Generate action predictions with the VLA policy.
+    """Generate one OpenVLA-OFT action chunk with the minimum cache side-channel."""
 
-    Args:
-        cfg: Configuration object with parameters
-        vla: The VLA model
-        processor: Model processor for inputs
-        obs: Observation dictionary
-        task_label: Text description of the task
-        action_head: Optional action head for continuous actions
-        proprio_projector: Optional proprioception projector
-        noisy_action_projector: Optional noisy action projector for diffusion
-        use_film: Whether to use FiLM
-
-    Returns:
-        List[np.ndarray]: Predicted actions
-    """
-    with torch.inference_mode():
-
-        # Collect all input images
-        all_images = [obs["full_image"]]
-        if cfg.num_images_in_input > 1:
-            all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
-
-        # Process images
-        all_images = prepare_images_for_vla(all_images, cfg)
-
-        # Extract primary image and additional images
-        primary_image = all_images.pop(0)
-
-        # Build VLA prompt
-        prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
-
-        # Process primary image
-        inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
-
-        # Process additional wrist images if any
-        if all_images:
-            all_wrist_inputs = [
-                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
-            ]
-            # Concatenate all images
-            primary_pixel_values = inputs["pixel_values"]
-            all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]
-            inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
-
-        # Process proprioception data if used
-        proprio = None
-        if cfg.use_proprio:
-            proprio = obs["state"]
-            proprio_norm_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
-            obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
-            proprio = obs["state"]
-
-        # Generate action
+    def _predict(inputs, proprio):
+        common = dict(
+            **inputs,
+            unnorm_key=cfg.unnorm_key,
+            do_sample=False,
+        )
         if action_head is None:
-            # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
-        else:
-            # Custom action head for continuous actions
-            action, _ = vla.predict_action(
-                **inputs,
-                unnorm_key=cfg.unnorm_key,
-                do_sample=False,
-                proprio=proprio,
-                proprio_projector=proprio_projector,
-                noisy_action_projector=noisy_action_projector,
-                action_head=action_head,
-                use_film=use_film,
+            return vla.predict_action(**common)
+        return vla.predict_action(
+            **common,
+            proprio=proprio,
+            proprio_projector=proprio_projector,
+            noisy_action_projector=noisy_action_projector,
+            action_head=action_head,
+            use_film=use_film,
+        )
+
+    with torch.inference_mode():
+        images = [obs["full_image"]]
+        if cfg.num_images_in_input > 1:
+            images.extend(obs[k] for k in obs if "wrist" in k)
+        images = prepare_images_for_vla(images, cfg)
+
+        prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
+        inputs = processor(prompt, images[0]).to(DEVICE, dtype=torch.bfloat16)
+
+        if len(images) > 1:
+            wrist_pixel_values = [
+                processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)["pixel_values"]
+                for image in images[1:]
+            ]
+            inputs["pixel_values"] = torch.cat(
+                [inputs["pixel_values"], *wrist_pixel_values], dim=1
             )
 
-    # Return action chunk as list of actions
-    return [action[i] for i in range(len(action))]
+        proprio = None
+        if cfg.use_proprio:
+            proprio_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
+            proprio = normalize_proprio(obs["state"], proprio_stats)
 
+        if not getattr(cfg, "use_dynam_cache", True):
+            action, _ = _predict(inputs, proprio)
+            return [action[i] for i in range(len(action))]
+
+        incoming_caches = last_caches if last_caches is not None else {}
+        if cfg.disable_kv_cache_reuse:
+            warped_cache = None
+
+        lm_config = vla.language_model.config
+        llama_model = vla.language_model.model
+        attention_layer_ids = tuple(
+            int(i) for i in getattr(cfg, "attention_layer_ids", (1,))
+        )
+
+        old_state = {
+            "warped_past_key_values": getattr(lm_config, "warped_past_key_values", None),
+            "force_cache_output": getattr(lm_config, "force_cache_output", False),
+            "force_attention_output": getattr(lm_config, "force_attention_output", False),
+            "force_hidden_states_output": getattr(lm_config, "force_hidden_states_output", False),
+            "collect_attn_layers": getattr(lm_config, "collect_attn_layers", None),
+        }
+
+        lm_config.warped_past_key_values = warped_cache
+        lm_config.force_cache_output = True
+        lm_config.force_attention_output = True
+        lm_config.force_hidden_states_output = False
+        lm_config.collect_attn_layers = list(attention_layer_ids)
+
+        try:
+            action, _ = _predict(inputs, proprio)
+            new_cache = getattr(llama_model, "last_forward_cache", None)
+            raw_attentions = getattr(llama_model, "last_forward_attentions", None)
+            kept_query_positions = getattr(
+                llama_model, "last_forward_kept_query_positions", None
+            )
+        finally:
+            for name, value in old_state.items():
+                setattr(lm_config, name, value)
+
+        prev_fixed_ema = incoming_caches.get("ema_fixed_spatial_map")
+        prev_wrist_ema = incoming_caches.get("ema_wrist_spatial_map")
+        prev_ema_step = int(incoming_caches.get("ema_attention_step", 0))
+        cached_content_word_groups = incoming_caches.get("content_word_groups")
+
+        incoming_caches.clear()
+        incoming_caches["past_key_values"] = new_cache
+        incoming_caches["kept_query_positions"] = kept_query_positions
+
+        attns = clean_attentions(raw_attentions)
+        if attns is not None:
+            spatial_layer_ids = [
+                layer_id for layer_id in attention_layer_ids
+                if 0 <= layer_id < len(attns) and attns[layer_id] is not None
+            ]
+            if not spatial_layer_ids:
+                raise RuntimeError(
+                    f"No requested attention layer was collected: {attention_layer_ids}"
+                )
+
+            num_patches_per_image = 256
+            fixed_token_start = 1
+            wrist_token_start = fixed_token_start + num_patches_per_image
+            num_image_tokens = num_patches_per_image * int(cfg.num_images_in_input)
+            query_token_start = (
+                fixed_token_start
+                + num_image_tokens
+                + (1 if cfg.use_proprio else 0)
+            )
+
+            attention_kept_positions = kept_query_positions
+            pruning_layers = getattr(lm_config, "progressive_pruning_layers", None)
+            if pruning_layers:
+                progressive_start_layer = min(int(x) for x in pruning_layers)
+                if all(layer_id < progressive_start_layer for layer_id in spatial_layer_ids):
+                    attention_kept_positions = None
+
+            prompt_token_count = int(inputs["input_ids"].shape[1])
+            text_query_end = query_token_start + max(prompt_token_count - 1, 0)
+            mode = str(getattr(cfg, "critical_attention_mode", "mixed"))
+
+            merge_kwargs = dict(
+                multihead_attention=attns,
+                layer_ids=spatial_layer_ids,
+                kept_query_positions=attention_kept_positions,
+                num_key_tokens=num_patches_per_image,
+            )
+
+            if mode == "content_words":
+                word_groups = cached_content_word_groups
+                if word_groups is None:
+                    text_token_ids = inputs["input_ids"][0, 1:prompt_token_count].tolist()
+                    text_token_strs = processor.tokenizer.convert_ids_to_tokens(text_token_ids)
+                    word_groups = get_content_word_row_groups(
+                        text_token_strs=text_token_strs,
+                        text_token_start=query_token_start,
+                    )
+                incoming_caches["content_word_groups"] = word_groups
+                fixed_scores = token_attention_merge_word_groups(
+                    **merge_kwargs,
+                    word_groups=word_groups,
+                    key_token_start=fixed_token_start,
+                )
+                wrist_scores = token_attention_merge_word_groups(
+                    **merge_kwargs,
+                    word_groups=word_groups,
+                    key_token_start=wrist_token_start,
+                )
+            else:
+                if mode == "mixed":
+                    q_start, q_end = query_token_start, None
+                elif mode == "text_only":
+                    q_start, q_end = query_token_start, text_query_end
+                elif mode == "status_only":
+                    if not cfg.use_proprio:
+                        raise ValueError("status_only requires cfg.use_proprio=True")
+                    q_start, q_end = query_token_start - 1, query_token_start
+                elif mode == "action_only":
+                    q_start, q_end = text_query_end, None
+                else:
+                    raise ValueError(f"Unknown critical_attention_mode: {mode}")
+
+                fixed_scores = token_attention_merge(
+                    **merge_kwargs,
+                    key_token_start=fixed_token_start,
+                    query_token_start=q_start,
+                    query_token_end=q_end,
+                )
+                wrist_scores = token_attention_merge(
+                    **merge_kwargs,
+                    key_token_start=wrist_token_start,
+                    query_token_start=q_start,
+                    query_token_end=q_end,
+                )
+
+            fixed_map = spatial_scores_to_map(fixed_scores, device=DEVICE).detach().cpu()
+            wrist_map = spatial_scores_to_map(wrist_scores, device=DEVICE).detach().cpu()
+            incoming_caches["latest_fixed_spatial_map"] = fixed_map
+            incoming_caches["latest_wrist_spatial_map"] = wrist_map
+
+            if getattr(cfg, "use_attention_ema", False):
+                alpha = float(np.clip(getattr(cfg, "attention_ema_alpha", 0.35), 0.0, 1.0))
+                incoming_caches["ema_fixed_spatial_map"] = (
+                    update_attention_ema(prev_fixed_ema, fixed_map, alpha)
+                    if getattr(cfg, "use_fixed_ema", True)
+                    else fixed_map
+                )
+                incoming_caches["ema_wrist_spatial_map"] = (
+                    update_attention_ema(prev_wrist_ema, wrist_map, alpha)
+                    if getattr(cfg, "use_wrist_ema", True)
+                    else wrist_map
+                )
+                incoming_caches["ema_attention_step"] = prev_ema_step + 1
+
+        return [action[i] for i in range(len(action))]
 
 def get_action_from_server(
     observation: Dict[str, Any], server_endpoint: str = "http://0.0.0.0:8777/act"
-) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
     """
     Get VLA action from remote inference server.
 

@@ -36,7 +36,11 @@ class RLDSBatchTransform:
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+
+        # img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        #[수정]
+        wrist_key = next(k for k in rlds_batch["observation"].keys() if "wrist" in k)
+        img = Image.fromarray(rlds_batch["observation"][wrist_key][0])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
 
@@ -75,15 +79,16 @@ class RLDSBatchTransform:
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
+        #[수정] wirst_image를 primary 로 바꾸기 위해.
         # Add additional inputs
-        if self.use_wrist_image:
-            all_wrist_pixels = []
-            for k in rlds_batch["observation"].keys():
-                if "wrist" in k:
-                    img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
-                    pixel_values_wrist = self.image_transform(img_wrist)
-                    all_wrist_pixels.append(pixel_values_wrist)
-            return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+        # if self.use_wrist_image:
+        #     all_wrist_pixels = []
+        #     for k in rlds_batch["observation"].keys():
+        #         if "wrist" in k:
+        #             img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
+        #             pixel_values_wrist = self.image_transform(img_wrist)
+        #             all_wrist_pixels.append(pixel_values_wrist)
+        #     return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
@@ -116,7 +121,7 @@ class RLDSDataset(IterableDataset):
         if "aloha" in self.data_mix:
             load_camera_views = ("primary", "left_wrist", "right_wrist")
         else:
-            load_camera_views = ("primary", "wrist")
+            load_camera_views = ("wrist",) #"primary",
 
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,

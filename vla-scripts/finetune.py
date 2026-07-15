@@ -964,7 +964,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     # ---
 
     # We assume that the model takes as input one third-person camera image and 1 or 2 optional wrist camera image(s)
-    use_wrist_image = cfg.num_images_in_input > 1
+    # use_wrist_image = cfg.num_images_in_input > 1
+    use_wrist_image = True
+    # use_third_person = False
 
     # Create training and optional validation datasets
     batch_transform = RLDSBatchTransform(
@@ -972,7 +974,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         processor.tokenizer,
         image_transform=processor.image_processor.apply_transform,
         prompt_builder_fn=PurePromptBuilder,
-        use_wrist_image=use_wrist_image,
+        use_wrist_image= True,# use_wrist_image,
+        # use_third_person = False,
         use_proprio=cfg.use_proprio,
     )
     train_dataset = RLDSDataset(
