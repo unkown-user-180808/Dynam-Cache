@@ -14,9 +14,8 @@ This repository is built on [OpenVLA-OFT](https://github.com/moojink/openvla-oft
   <em>Overview of Dynam-Cache.</em>
 </p>
 
-<p align="center">
-  🎥 <a href="assets/demo/icra_2027_dynam_final.mp4">Demo Video</a>
-</p>
+### Demo
+https://github.com/unkown-user-180808/Dynam-Cache/blob/main/assets/demo/icra_2027_dynam_final.mp4
 
 ## Overview
 
