@@ -1,5 +1,5 @@
 # attention_utils.py
-from typing import Tuple
+from typing import Tuple, Dict, Iterable
 
 import torch
 import numpy as np
@@ -327,586 +327,46 @@ def order_candidates_for_pruning(
     fixed_token_start,
     wrist_token_start,
     num_patches_per_image,
-    mode="original",
+    mode="normattn_global",
     progressive_drop_ratios=None,
 ):
     """
-    both-view reuse candidate를 지정된 mode로 정렬하여 반환.
+    Sort both-view reuse candidates using the final release policy:
+    normalize attention ranks within each view, then globally sort from
+    least important to most important.
 
-    mode:
-        interleave       - attention 낮은 순으로 각 view 정렬 후 번갈아 배치
-        normattn_global  - view-wise rank normalize 후 global sort (낮은 순)
-        viewattn_ratioaware - ratio 미리 알고 view별 비율 맞춰 구간 배치
+    The release evaluator no longer supports legacy candidate-ordering
+    experiment modes. Any provided mode is ignored and the final
+    normattn_global behavior is always used.
     """
+    _ = mode
+    _ = progressive_drop_ratios
+    _ = num_patches_per_image
 
-    # 각 view별 attention 낮은 순 정렬
-    fixed_sorted = sort_candidates_by_attn(
-        fixed_candidates, fixed_attn_map, fixed_token_start, num_patches_per_image
+    fixed_ranks = rank_normalize_attn(
+        fixed_candidates,
+        fixed_attn_map,
+        fixed_token_start,
+        num_patches_per_image,
     )
-    wrist_sorted = sort_candidates_by_attn(
-        wrist_candidates, wrist_attn_map, wrist_token_start, num_patches_per_image
+    wrist_ranks = rank_normalize_attn(
+        wrist_candidates,
+        wrist_attn_map,
+        wrist_token_start,
+        num_patches_per_image,
     )
 
-    if mode == "interleave":
-        interleaved = []
-        for f, w in zip(fixed_sorted, wrist_sorted):
-            interleaved.extend([f, w])
-        len_min = min(len(fixed_sorted), len(wrist_sorted))
-        interleaved += fixed_sorted[len_min:] + wrist_sorted[len_min:]
-        return interleaved
+    all_candidates = list(fixed_candidates) + list(wrist_candidates)
+    all_ranks = {**fixed_ranks, **wrist_ranks}
 
-    elif mode == "normattn_global":
-        fixed_ranks = rank_normalize_attn(
-            fixed_candidates, fixed_attn_map, fixed_token_start, num_patches_per_image
-        )
-        wrist_ranks = rank_normalize_attn(
-            wrist_candidates, wrist_attn_map, wrist_token_start, num_patches_per_image
-        )
-        all_candidates = fixed_candidates + wrist_candidates
-        all_ranks = {**fixed_ranks, **wrist_ranks}
-        return sorted(all_candidates, key=lambda idx: all_ranks.get(idx, 0.5))
+    return sorted(
+        all_candidates,
+        key=lambda idx: all_ranks.get(idx, 0.5),
+    )
 
-    
-    elif mode == "viewattn_ratioaware":
-        if not progressive_drop_ratios:
-            # ratio 없으면 interleave fallback
-            interleaved = []
-            for f, w in zip(fixed_sorted, wrist_sorted):
-                interleaved.extend([f, w])
-            len_min = min(len(fixed_sorted), len(wrist_sorted))
-            interleaved += fixed_sorted[len_min:] + wrist_sorted[len_min:]
-            return interleaved
-
-        n_fixed = len(fixed_sorted)
-        n_wrist = len(wrist_sorted)
-        total_cands = n_fixed + n_wrist
-
-        result = []
-        fixed_used = 0
-        wrist_used = 0
-        prev_ratio = 0.0
-
-        for ratio in progressive_drop_ratios:
-            n_total_drop = int(ratio * total_cands)
-            n_new_drop = n_total_drop - int(prev_ratio * total_cands)
-            if n_new_drop <= 0:
-                prev_ratio = ratio
-                continue
-            # fixed/wrist 수 비율에 맞게 이 구간 배분
-            n_fixed_drop = int(n_new_drop * n_fixed / max(total_cands, 1))
-            n_wrist_drop = n_new_drop - n_fixed_drop
-            result += fixed_sorted[fixed_used:fixed_used + n_fixed_drop]
-            result += wrist_sorted[wrist_used:wrist_used + n_wrist_drop]
-            fixed_used += n_fixed_drop
-            wrist_used += n_wrist_drop
-            prev_ratio = ratio
-
-        # 남은 것 (끝까지 살아남을 것들)
-        result += fixed_sorted[fixed_used:]
-        result += wrist_sorted[wrist_used:]
-        return result
-
-    # fallback
-    return fixed_candidates + wrist_candidates
 
 #################################################################
-################ adaptive pruning budget helpers ################
 #################################################################
-
-ONLINE_ADAPTIVE_SIGNAL_NAMES = (
-    "hole_ratio",
-    "cam_trans_delta",
-    "cam_rot_delta_rad",
-
-    "recent_eef_speed",
-    "recent_speed_drop_ratio",
-    "recent_abs_accel",
-    "recent_abs_jerk",
-
-    "recent_dgripper_asym",
-    "recent_action_eef_ratio",
-
-    "direction_dip_ratio",
-    "direction_cosine_std",
-)
-
-MOTION_SIGNAL_NAMES = (
-    "hole_ratio",
-    "cam_trans_delta",
-    "cam_rot_delta_rad",
-)
-
-TRANSITION_SIGNAL_NAMES = (
-    "recent_speed_drop_ratio",
-    "recent_abs_accel",
-    "recent_abs_jerk",
-    "direction_dip_ratio",
-    "direction_cosine_std",
-)
-
-CONTACT_SIGNAL_NAMES = (
-    "recent_dgripper_asym",
-    "recent_action_eef_ratio",
-)
-
-def interpolate_total_prune_ratios_from_risk(
-    risk_score: float,
-    min_total_prune_ratios,
-    max_total_prune_ratios,
-):
-    """
-    risk_score=0.0 -> max pruning
-    risk_score=1.0 -> min pruning
-    """
-    r = float(np.clip(risk_score, 0.0, 1.0))
-
-    min_ratios = np.asarray(min_total_prune_ratios, dtype=np.float32)
-    max_ratios = np.asarray(max_total_prune_ratios, dtype=np.float32)
-
-    target = max_ratios - r * (max_ratios - min_ratios)
-
-    # monotonic 보장
-    for i in range(1, len(target)):
-        target[i] = max(target[i], target[i - 1])
-
-    return tuple(float(x) for x in target)
-
-def _valid_float_or_none(x):
-    if x is None:
-        return None
-    try:
-        x = float(x)
-    except Exception:
-        return None
-    if not np.isfinite(x):
-        return None
-    return x
-
-
-def _clamp01(x):
-    x = _valid_float_or_none(x)
-    if x is None:
-        return 0.0
-    return float(np.clip(x, 0.0, 1.0))
-
-
-def _percentile_rank(value, history):
-    """
-    현재 value가 history 안에서 어느 정도 큰지 0~1로 반환.
-    high value = high rank.
-    단, high rank가 항상 high risk라는 뜻은 아님.
-    eef_speed는 high rank를 transit signal로 해석할 수 있음.
-    """
-    v = _valid_float_or_none(value)
-    if v is None:
-        return 0.0
-
-    hist = [_valid_float_or_none(x) for x in history]
-    hist = [x for x in hist if x is not None]
-
-    if len(hist) == 0:
-        return 0.0
-
-    hist = np.asarray(hist, dtype=np.float32)
-
-    if float(hist.max() - hist.min()) < 1e-8:
-        return 0.0
-
-    return float((hist <= v).mean())
-
-
-def _aggregate_ranks(ranks, mode="top2_mean"):
-    vals = [float(v) for v in ranks if v is not None and np.isfinite(float(v))]
-
-    if len(vals) == 0:
-        return 0.0
-
-    vals = np.asarray(vals, dtype=np.float32)
-
-    if mode == "max":
-        return float(vals.max())
-
-    if mode == "mean":
-        return float(vals.mean())
-
-    # default: top2_mean
-    vals_sorted = np.sort(vals)[::-1]
-    k = min(2, len(vals_sorted))
-    return float(vals_sorted[:k].mean())
-
-
-class OnlineAdaptiveRiskController:
-    """
-    Warmup-guarded exposure-aware pruning controller.
-
-    핵심:
-    - eef_speed high를 risk로 보지 않는다.
-    - motion signal은 보조적인 modifier로만 사용한다.
-    - exposure는 accelerator가 아니라 brake로 사용한다.
-    - 초반 cold-start에서는 aggressive pruning을 막는다.
-    - low-speed + gripper/contact/exposure 상황을 precision risk로 본다.
-    """
-
-    def __init__(
-        self,
-        window_size: int = 20,
-        min_history: int = 8,
-        ema_alpha: float = 0.35,
-        warmup_risk: float = 0.5,
-        aggregation: str = "top2_mean",
-        phase_low: float = 0.33,
-        phase_high: float = 0.67,
-
-        warmup_fraction: float = 1.0,
-        exposure_start_cycle: float = 1.0,
-        exposure_full_cycle: float = 2.5,
-
-        motion_weight: float = 0.0,
-        precision_weight: float = 1.0,
-        exposure_weight: float = 1.0,
-    ):
-        self.window_size = int(window_size)
-        self.min_history = int(min_history)
-        self.ema_alpha = float(ema_alpha)
-        self.warmup_risk = float(warmup_risk)
-        self.aggregation = str(aggregation)
-        self.phase_low = float(phase_low)
-        self.phase_high = float(phase_high)
-
-        self.warmup_fraction = float(warmup_fraction)
-        self.exposure_start_cycle = float(exposure_start_cycle)
-        self.exposure_full_cycle = float(exposure_full_cycle)
-
-        self.motion_weight = float(motion_weight)
-        self.precision_weight = float(precision_weight)
-        self.exposure_weight = float(exposure_weight)
-
-        self.histories = {
-            name: deque(maxlen=self.window_size)
-            for name in ONLINE_ADAPTIVE_SIGNAL_NAMES
-        }
-
-        self.risk_ema = None
-
-    def _compute_exposure_score(self, exposure: dict):
-        if exposure is None:
-            return 0.0, {}
-
-        stale_thr = max(1.0, float(exposure.get("stale_force_threshold", 8)))
-        past_llm_calls = float(exposure.get("past_llm_calls", 0.0))
-
-        exposure_start_calls = stale_thr * self.exposure_start_cycle
-        exposure_full_calls = stale_thr * self.exposure_full_cycle
-
-        call_exposure = np.clip(
-            (past_llm_calls - exposure_start_calls)
-            / max(1.0, exposure_full_calls - exposure_start_calls),
-            0.0,
-            1.0,
-        )
-
-        fixed_cache_age_mean = float(exposure.get("fixed_cache_age_mean", 0.0))
-        wrist_cache_age_mean = float(exposure.get("wrist_cache_age_mean", 0.0))
-        fixed_cache_age_max = float(exposure.get("fixed_cache_age_max", 0.0))
-        wrist_cache_age_max = float(exposure.get("wrist_cache_age_max", 0.0))
-
-        fixed_stale_ge_ratio = float(exposure.get("fixed_stale_ge_ratio", 0.0))
-        wrist_stale_ge_ratio = float(exposure.get("wrist_stale_ge_ratio", 0.0))
-
-        fixed_recency_blocked_ratio = float(exposure.get("fixed_recency_blocked_ratio", 0.0))
-        wrist_recency_blocked_ratio = float(exposure.get("wrist_recency_blocked_ratio", 0.0))
-
-        max_age_exposure = max(fixed_cache_age_max, wrist_cache_age_max) / stale_thr
-        mean_age_exposure = max(fixed_cache_age_mean, wrist_cache_age_mean) / stale_thr
-        stale_ge_exposure = max(fixed_stale_ge_ratio, wrist_stale_ge_ratio) / 100.0
-        recency_block_exposure = max(fixed_recency_blocked_ratio, wrist_recency_blocked_ratio) / 100.0
-
-        components = {
-            "call_exposure": _clamp01(call_exposure),
-            "max_age_exposure": _clamp01(max_age_exposure),
-            "mean_age_exposure": _clamp01(mean_age_exposure),
-            "stale_ge_exposure": _clamp01(stale_ge_exposure),
-            "recency_block_exposure": _clamp01(recency_block_exposure),
-            "exposure_start_calls": float(exposure_start_calls),
-            "exposure_full_calls": float(exposure_full_calls),
-        }
-
-        age_exposure = max(
-            0.40 * max_age_exposure,
-            0.50 * mean_age_exposure,
-        )
-
-        # stale patch가 실제로 넓게 퍼졌을 때만 max_age를 강하게 믿음
-        if stale_ge_exposure > 0.05 or recency_block_exposure > 0.05:
-            age_exposure = max(age_exposure, 0.70 * max_age_exposure)
-
-        exposure_score = max(
-            call_exposure,
-            age_exposure,
-            stale_ge_exposure,
-            recency_block_exposure,
-        )
-
-        return _clamp01(exposure_score), components
-
-    def _compute_warmup_factor(self, exposure: dict):
-        """
-        초반에는 exposure가 낮아도 aggressive 금지.
-        warmup_factor=0 -> cold-start
-        warmup_factor=1 -> warmup 완료
-        """
-        if exposure is None:
-            return 0.0
-
-        stale_thr = max(1.0, float(exposure.get("stale_force_threshold", 8)))
-        past_llm_calls = float(exposure.get("past_llm_calls", 0.0))
-
-        warmup_total_calls = stale_thr * self.warmup_fraction
-
-        return _clamp01(
-            past_llm_calls / max(1.0, warmup_total_calls)
-        )
-
-    def score(self, signals: dict, exposure: dict = None):
-        cleaned_signals = {}
-        per_signal_rank = {}
-        history_lengths = {}
-
-        for name in ONLINE_ADAPTIVE_SIGNAL_NAMES:
-            value = _valid_float_or_none(signals.get(name, None))
-            cleaned_signals[name] = value
-
-            hist = self.histories[name]
-            history_lengths[name] = len(hist)
-
-            if len(hist) < self.min_history:
-                per_signal_rank[name] = self.warmup_risk
-            else:
-                per_signal_rank[name] = _percentile_rank(value, hist)
-
-        # ------------------------------------------------------------
-        # Motion score
-        # ------------------------------------------------------------
-        # motion은 위험도 그 자체가 아니라 frame-to-frame change의 크기.
-        # pruning risk에는 낮은 weight로만 반영.
-        motion_score = _aggregate_ranks(
-            [per_signal_rank.get(name, 0.0) for name in MOTION_SIGNAL_NAMES],
-            mode=self.aggregation,
-        )
-
-        # ------------------------------------------------------------
-        # Speed interpretation
-        # ------------------------------------------------------------
-        # eef_speed high = transit 가능성.
-        # eef_speed low + gripper/exposure = precision/contact risk 가능성.
-        eef_speed_rank = float(per_signal_rank.get("recent_eef_speed", self.warmup_risk))
-        low_speed_score = 1.0 - eef_speed_rank
-
-        gripper_rank = float(per_signal_rank.get("recent_dgripper_asym", 0.0))
-
-        # ------------------------------------------------------------
-        # Exposure brake
-        # ------------------------------------------------------------
-        exposure_score, exposure_components = self._compute_exposure_score(exposure)
-
-        warmup_factor = self._compute_warmup_factor(exposure)
-        cold_start_brake = 1.0 - warmup_factor
-
-        # ------------------------------------------------------------
-        # Precision/contact risk
-        # ------------------------------------------------------------
-        # low speed alone is not risk.
-        # low speed + gripper transition or accumulated exposure is risk.
-        transition_score = _aggregate_ranks(
-            [per_signal_rank.get(name, 0.0) for name in TRANSITION_SIGNAL_NAMES],
-            mode=self.aggregation,
-        )
-
-        contact_score = _aggregate_ranks(
-            [per_signal_rank.get(name, 0.0) for name in CONTACT_SIGNAL_NAMES],
-            mode="max",
-        )
-
-        eef_speed_rank = float(per_signal_rank.get("recent_eef_speed", self.warmup_risk))
-        low_speed_score = 1.0 - eef_speed_rank
-
-        precision_score = max(
-            transition_score * max(contact_score, 0.5 * exposure_score),
-            low_speed_score * max(contact_score, 0.5 * exposure_score),
-
-            # transition 자체가 매우 강하면 precision risk로 인정
-            0.60 * transition_score,
-        )
-
-        # ------------------------------------------------------------
-        # Final budget risk
-        # ------------------------------------------------------------
-        # risk가 높을수록 conservative target으로 이동.
-        # motion은 낮은 weight.
-        instant_risk = max(
-            cold_start_brake,
-            self.exposure_weight * exposure_score,
-            self.precision_weight * precision_score,
-            self.motion_weight * motion_score,
-        )
-
-        instant_risk = _clamp01(instant_risk)
-
-        if self.risk_ema is None:
-            self.risk_ema = float(instant_risk)
-        else:
-            self.risk_ema = (
-                self.ema_alpha * float(instant_risk)
-                + (1.0 - self.ema_alpha) * float(self.risk_ema)
-            )
-
-        risk_score = _clamp01(self.risk_ema)
-
-        if risk_score >= self.phase_high:
-            global_phase = "risky"        # compatibility label
-            budget_mode = "conservative"
-        elif risk_score >= self.phase_low:
-            global_phase = "normal"
-            budget_mode = "balanced"
-        else:
-            global_phase = "stable_late"  # compatibility label
-            budget_mode = "aggressive"
-
-        score_components = {
-            "motion_score": float(motion_score),
-            "exposure_score": float(exposure_score),
-            "precision_score": float(precision_score),
-            "cold_start_brake": float(cold_start_brake),
-            "warmup_factor": float(warmup_factor),
-            "eef_speed_rank": float(eef_speed_rank),
-            "low_speed_score": float(low_speed_score),
-            "gripper_rank": float(gripper_rank),
-        }
-
-        reasons = [
-            f"mode={budget_mode}",
-            f"motion={motion_score:.2f}",
-            f"exposure={exposure_score:.2f}",
-            f"precision={precision_score:.2f}",
-            f"cold_start={cold_start_brake:.2f}",
-            f"eef_speed_rank={eef_speed_rank:.2f}",
-            f"low_speed={low_speed_score:.2f}",
-            f"gripper_rank={gripper_rank:.2f}",
-        ]
-
-        phase_info = {
-            "global_phase": global_phase,
-            "budget_mode": budget_mode,
-
-            "risk_score": risk_score,
-            "instant_risk_score": float(instant_risk),
-
-            "per_signal_risk": dict(per_signal_rank),  # debug 호환용 이름
-            "per_signal_rank": dict(per_signal_rank),
-
-            "score_components": score_components,
-            "exposure_components": exposure_components,
-
-            "dominant_signal": max(
-                score_components.items(),
-                key=lambda kv: kv[1],
-            )[0],
-
-            "reasons": reasons,
-            "fixed_reasons": reasons,
-            "wrist_reasons": reasons,
-
-            "signals": cleaned_signals,
-            "exposure": exposure if exposure is not None else {},
-
-            "history_lengths": dict(history_lengths),
-            "aggregation": self.aggregation,
-            "window_size": self.window_size,
-            "min_history": self.min_history,
-            "ema_alpha": self.ema_alpha,
-        }
-
-        # 현재 값을 scoring한 뒤 history에 넣는다.
-        for name, value in cleaned_signals.items():
-            if value is not None:
-                self.histories[name].append(float(value))
-
-        return phase_info
-
-
-def build_online_global_adaptive_pruning_plan(
-    risk_controller: OnlineAdaptiveRiskController,
-    signals: dict,
-    n_candidates: int,
-    ref_total_tokens: int,
-    fixed_available: int = 0,
-    wrist_available: int = 0,
-    exposure: dict = None,
-    min_total_prune_ratios=(0.078, 0.235, 0.313),
-    max_total_prune_ratios=(0.158, 0.290, 0.485),
-):
-    """
-    Online controller로 target ratio와 candidate-list ratio까지 계산.
-    run_libero_eval.py에서는 이 함수만 호출하면 됨.
-    """
-
-    adaptive_phase_info = risk_controller.score(
-        signals=signals,
-        exposure=exposure,
-    )
-
-    target_total_ratios = interpolate_total_prune_ratios_from_risk(
-        risk_score=adaptive_phase_info["risk_score"],
-        min_total_prune_ratios=min_total_prune_ratios,
-        max_total_prune_ratios=max_total_prune_ratios,
-    )
-
-    dynamic_ratios, target_counts = total_ratio_targets_to_candidate_ratios(
-        target_total_ratios=target_total_ratios,
-        n_candidates=n_candidates,
-        ref_total_tokens=ref_total_tokens,
-    )
-
-    stats = {
-        "global_phase": adaptive_phase_info["global_phase"],
-        "budget_mode": adaptive_phase_info["budget_mode"],
-
-        "risk_score": adaptive_phase_info["risk_score"],
-        "instant_risk_score": adaptive_phase_info["instant_risk_score"],
-
-        "per_signal_risk": adaptive_phase_info["per_signal_risk"],
-        "per_signal_rank": adaptive_phase_info["per_signal_rank"],
-
-        "score_components": adaptive_phase_info["score_components"],
-        "exposure_components": adaptive_phase_info["exposure_components"],
-
-        "dominant_signal": adaptive_phase_info["dominant_signal"],
-        "reasons": adaptive_phase_info["reasons"],
-        "fixed_reasons": adaptive_phase_info["fixed_reasons"],
-        "wrist_reasons": adaptive_phase_info["wrist_reasons"],
-
-        "target_total_ratios": target_total_ratios,
-        "target_counts": target_counts,
-        "dynamic_ratios": dynamic_ratios,
-
-        "num_candidates": int(n_candidates),
-        "ref_total_tokens": int(ref_total_tokens),
-        "fixed_available": int(fixed_available),
-        "wrist_available": int(wrist_available),
-
-        "history_lengths": adaptive_phase_info["history_lengths"],
-        "aggregation": adaptive_phase_info["aggregation"],
-        "exposure": exposure if exposure is not None else {},
-    }
-
-    return (
-        adaptive_phase_info,
-        target_total_ratios,
-        dynamic_ratios,
-        target_counts,
-        stats,
-    )
-
 
 def total_ratio_targets_to_candidate_ratios(
     target_total_ratios,
@@ -1062,6 +522,16 @@ def warp_attention_map_with_mapping(
 ################ critical patch 뽑는 함수 #########################
 #################################################################
 
+def compute_topk_patch_indices(attn_scores, top_k=100):
+    """Protect the top-k highest-attention visual patches (A1/VLA-Cache-style)."""
+    flat_scores = flatten_attention_scores(attn_scores)
+    if flat_scores.size == 0 or int(top_k) <= 0:
+        return []
+    k = min(int(top_k), int(flat_scores.size))
+    order = np.argsort(-flat_scores, kind="stable")[:k]
+    return [int(idx) for idx in order]
+
+
 def compute_critical_patch_indices(attn_scores, zscore_k=0.20):
     """attention score 평균 + zscore_k*std 이상인 패치 인덱스를 반환."""
     flat_scores = flatten_attention_scores(attn_scores)
@@ -1104,3 +574,112 @@ def apply_view_budget_cap(
     # attention 낮은 순으로 정렬 후 max_count만 남김
     sorted_cands = sort_candidates_by_attn(candidates, attn_map, token_start, num_patches_per_image)
     return sorted_cands[:max_count]
+
+#################### entropy calculation ########################
+@torch.no_grad()
+
+@torch.no_grad()
+def token_attention_word_group_stats(
+    multihead_attention,
+    word_groups,
+    layer_ids=(1,),
+    kept_query_positions=None,
+    key_token_start=1,
+    num_key_tokens=256,
+):
+    """Return per-word visual mass before normalization and a spatial map."""
+    key_token_end = key_token_start + num_key_tokens
+    results = []
+
+    for group in word_groups:
+        layer_raw_scores = []
+
+        for layer_id in layer_ids:
+            if (
+                layer_id >= len(multihead_attention)
+                or multihead_attention[layer_id] is None
+            ):
+                continue
+
+            attn = (
+                multihead_attention[layer_id]
+                .to(torch.float32)
+                .squeeze(0)
+                .mean(dim=0)
+            )
+            q_len, k_len = attn.shape
+            local_key_end = min(key_token_end, k_len)
+            if local_key_end <= key_token_start:
+                continue
+
+            rows = torch.as_tensor(
+                group["rows"],
+                dtype=torch.long,
+                device=attn.device,
+            )
+            rows = rows[(rows >= 0) & (rows < q_len)]
+            if rows.numel() == 0:
+                continue
+
+            relation = attn[rows, key_token_start:local_key_end]
+            raw_score = torch.nan_to_num(
+                relation.mean(dim=0),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            if raw_score.numel() < num_key_tokens:
+                raw_score = F.pad(
+                    raw_score,
+                    (0, num_key_tokens - raw_score.numel()),
+                )
+            elif raw_score.numel() > num_key_tokens:
+                raw_score = raw_score[:num_key_tokens]
+
+            layer_raw_scores.append(raw_score)
+
+        if not layer_raw_scores:
+            continue
+
+        raw_score = torch.stack(layer_raw_scores, dim=0).mean(dim=0)
+        vision_mass = float(raw_score.sum().item())
+        spatial_map = (
+            raw_score / raw_score.sum().clamp_min(1e-8)
+        ).detach().cpu()
+
+        results.append(
+            {
+                "word": str(group["word"]),
+                "tokens": list(group["tokens"]),
+                "rows": list(group["rows"]),
+                "vision_mass": vision_mass,
+                "spatial_map": spatial_map,
+            }
+        )
+
+    return results
+
+
+def merge_fixed_wrist_word_stats(fixed_stats, wrist_stats):
+    fixed_by_word = {item["word"]: item for item in fixed_stats}
+    wrist_by_word = {item["word"]: item for item in wrist_stats}
+    merged = []
+
+    for word in sorted(set(fixed_by_word) | set(wrist_by_word)):
+        fixed = fixed_by_word.get(word)
+        wrist = wrist_by_word.get(word)
+        fixed_mass = float(fixed["vision_mass"]) if fixed else 0.0
+        wrist_mass = float(wrist["vision_mass"]) if wrist else 0.0
+        merged.append(
+            {
+                "word": word,
+                "fixed_vision_mass": fixed_mass,
+                "wrist_vision_mass": wrist_mass,
+                "vision_mass": fixed_mass + wrist_mass,
+                "fixed_spatial_map": fixed["spatial_map"] if fixed else None,
+                "wrist_spatial_map": wrist["spatial_map"] if wrist else None,
+            }
+        )
+
+    return merged

@@ -1,4 +1,4 @@
-import os
+# warping_utils.py
 import numpy as np
 import cv2
 import torch
@@ -147,6 +147,44 @@ def rotation_delta_angle_rad(T_prev, T_curr):
     cos_theta = float(np.clip((np.trace(rotation_delta) - 1.0) / 2.0, -1.0, 1.0))
     return float(np.arccos(cos_theta))
 
+def compute_vla_cache_static_patch_indices(
+    img_pre: np.ndarray,
+    img_post: np.ndarray,
+    *,
+    patch_size: int = 14,
+    resize_hw=(224, 224),
+    top_k: int = 150,
+    sim_threshold: float = 0.996,
+):
+    """VLA-Cache-style same-index static patch selection for A1.
+
+    The supplied VLA-Cache utility uses 224x224 images, 14x14 RGB patches,
+    cosine similarity, threshold 0.996, and a top-150 cap. Resizing here makes
+    the behavior explicit even when the evaluator observation is still 256x256.
+    """
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+
+    def _patch_vectors(image):
+        x = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).unsqueeze(0)
+        x = x.to(device=device, dtype=torch.float32).div_(255.0)
+        if tuple(x.shape[-2:]) != tuple(resize_hw):
+            x = F.interpolate(x, size=resize_hw, mode="bilinear", align_corners=False)
+        h, w = resize_hw
+        if h % patch_size or w % patch_size:
+            raise ValueError("resize_hw must be divisible by patch_size")
+        p = x.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+        return p.permute(0, 2, 3, 1, 4, 5).contiguous().view(-1, 3 * patch_size * patch_size)
+
+    pre = _patch_vectors(img_pre)
+    post = _patch_vectors(img_post)
+    similarity = F.cosine_similarity(pre, post, dim=1, eps=1e-8)
+    valid = torch.where(similarity >= float(sim_threshold))[0]
+    if valid.numel() == 0:
+        return []
+    order = torch.argsort(similarity[valid], descending=True, stable=True)
+    return valid[order[: min(int(top_k), int(order.numel()))]].detach().cpu().tolist()
+
+
 class WarpTracker:
     def __init__(self, keyframe_interval=None):
         self.plane_cached, self.cam_cached = False, False
@@ -228,64 +266,156 @@ class WarpTracker:
         device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         height, width = feat_shape
 
-        n_c_key, d_key = plane_in_cam_from_world(
-            T_w_c_pre,
-            self.table_n_w,
-            self.table_p0_w,
+        # --------------------------------------------------------------
+        # MuJoCo camera frame -> CV optical frame.
+        #
+        # MuJoCo:
+        #   +X right, +Y up, viewing direction -Z
+        #
+        # CV optical:
+        #   +X right, +Y down, viewing direction +Z
+        # --------------------------------------------------------------
+        C4 = np.eye(4, dtype=np.float64)
+        C4[:3, :3] = np.diag([1.0, -1.0, -1.0])
+
+        T_w_cv_pre = np.asarray(T_w_c_pre, dtype=np.float64) @ C4
+        T_w_cv_post = np.asarray(T_w_c_post, dtype=np.float64) @ C4
+
+        # Transform a point from previous CV camera -> current CV camera.
+        T_post_from_pre = invert_T(T_w_cv_post) @ T_w_cv_pre
+        R_post_pre = T_post_from_pre[:3, :3]
+        t_post_pre = T_post_from_pre[:3, 3]
+
+        # Table plane in the previous CV-camera coordinates.
+        T_cv_pre_w = invert_T(T_w_cv_pre)
+
+        n_pre = (
+            T_cv_pre_w[:3, :3]
+            @ np.asarray(self.table_n_w, dtype=np.float64)
         )
-        if d_key < 0:
-            n_c_key, d_key = -n_c_key, -d_key
-            
-        # 2. 호모그래피 및 피처용 변환 행렬 계산
-        relative = relative_T(T_w_c_pre, T_w_c_post)
-        H_img = homography_from_Rt_plane(
-            self.K_proc,
-            relative[:3, :3].T,
-            relative[:3, 3],
-            n_c_key,
-            d_key,
+        n_pre /= np.linalg.norm(n_pre) + 1e-12
+
+        p0_pre = (
+            T_cv_pre_w[:3, :3]
+            @ np.asarray(self.table_p0_w, dtype=np.float64)
+            + T_cv_pre_w[:3, 3]
         )
+
+        d_pre = float(n_pre @ p0_pre)
+
+        if abs(d_pre) < 1e-10:
+            raise RuntimeError(
+                "Degenerate table-plane distance in previous CV camera."
+            )
+
+        K = np.asarray(self.K_proc, dtype=np.float64)
+
+        # Previous image -> current image.
+        H_img = K @ (
+            R_post_pre
+            + (
+                t_post_pre.reshape(3, 1)
+                @ n_pre.reshape(1, 3)
+            ) / d_pre
+        ) @ np.linalg.inv(K)
+
         H_img /= H_img[2, 2]
+
         self.last_H_img = H_img
         self.last_img_pre = img_pre
         self.last_T_w_c_pre = T_w_c_pre
 
-        scale = np.array(
-            [
-                [width / img_shape[1], 0.0, 0.0],
-                [0.0, height / img_shape[0], 0.0],
-                [0.0, 0.0, 1.0],
-            ]
+        # --------------------------------------------------------------
+        # Current visual-token centers -> previous visual-token positions.
+        #
+        # Example for 256x256 and 16x16:
+        # token centers are 7.5, 23.5, 39.5, ...
+        # --------------------------------------------------------------
+        current_coordinates = self._feature_coordinates(
+            feat_shape,
+            device,
         )
-        H_feature = scale @ H_img @ np.linalg.inv(scale)
-        H_inverse = torch.as_tensor(
-            np.linalg.inv(H_feature),
+
+        img_h = int(img_shape[0])
+        img_w = int(img_shape[1])
+
+        current_u = (
+            (current_coordinates[0] + 0.5)
+            * (float(img_w) / float(width))
+            - 0.5
+        )
+        current_v = (
+            (current_coordinates[1] + 0.5)
+            * (float(img_h) / float(height))
+            - 0.5
+        )
+
+        current_pixels = torch.stack(
+            [
+                current_u,
+                current_v,
+                torch.ones_like(current_u),
+            ],
+            dim=0,
+        )
+
+        H_inverse_img = torch.as_tensor(
+            np.linalg.inv(H_img),
             dtype=torch.float32,
             device=device,
         )
-        # 3. 좌표 추적 및 Grid 생성
-        current_coordinates = self._feature_coordinates(feat_shape, device)
-        source_coordinates = H_inverse @ current_coordinates
-        source_coordinates[:2] /= source_coordinates[2:3] + 1e-8
 
-        source_x_round = torch.round(source_coordinates[0]).long()
-        source_y_round = torch.round(source_coordinates[1]).long()
+        # H_img is previous -> current, therefore H^-1 gives:
+        # current target pixel -> previous source pixel.
+        source_pixels = H_inverse_img @ current_pixels
+        source_pixels[:2] /= source_pixels[2:3] + 1e-8
+
+        source_u = source_pixels[0]
+        source_v = source_pixels[1]
+
+        # Previous pixel -> continuous previous visual-token coordinate.
+        source_x = (
+            (source_u + 0.5)
+            * (float(width) / float(img_w))
+            - 0.5
+        )
+        source_y = (
+            (source_v + 0.5)
+            * (float(height) / float(img_h))
+            - 0.5
+        )
+
+        source_coordinates = torch.stack(
+            [
+                source_x,
+                source_y,
+                torch.ones_like(source_x),
+            ],
+            dim=0,
+        )
+
+        source_x_round = torch.round(source_x).long()
+        source_y_round = torch.round(source_y).long()
+
         within_bounds = (
             (source_x_round >= 0)
             & (source_x_round < width)
             & (source_y_round >= 0)
             & (source_y_round < height)
         )
+
+        # target current token i -> previous source token warp_mapping[i]
         warp_mapping = torch.where(
             within_bounds,
             source_y_round * width + source_x_round,
             torch.zeros_like(source_x_round),
         )
 
+
         source_grid = torch.stack(
             [
-                (source_coordinates[0] / (width - 1)) * 2.0 - 1.0,
-                (source_coordinates[1] / (height - 1)) * 2.0 - 1.0,
+                (source_u / max(img_w - 1, 1)) * 2.0 - 1.0,
+                (source_v / max(img_h - 1, 1)) * 2.0 - 1.0,
             ],
             dim=-1,
         ).reshape(1, height, width, 2)

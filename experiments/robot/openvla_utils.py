@@ -34,7 +34,6 @@ ACTION_PROPRIO_NORMALIZATION_TYPE,
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
 from experiments.robot.libero.attention_utils import (
-token_attention_merge,
 spatial_scores_to_map,
 update_attention_ema,
 get_content_word_row_groups,
@@ -695,7 +694,14 @@ def get_vla_action(
     last_caches: Optional[dict] = None,
     warped_cache=None,
 ) -> List[np.ndarray]:
-    """Generate one OpenVLA-OFT action chunk with the minimum cache side-channel."""
+    """Generate one OpenVLA-OFT action chunk.
+
+    Standard OpenVLA-OFT performs a full forward pass.
+
+    When Dynam-Cache is enabled, this function additionally exposes the
+    transformer KV cache and the instruction-guided spatial attention maps
+    required by the next policy query.
+    """
 
     def _predict(inputs, proprio):
         common = dict(
@@ -703,8 +709,10 @@ def get_vla_action(
             unnorm_key=cfg.unnorm_key,
             do_sample=False,
         )
+
         if action_head is None:
             return vla.predict_action(**common)
+
         return vla.predict_action(
             **common,
             proprio=proprio,
@@ -716,181 +724,358 @@ def get_vla_action(
 
     with torch.inference_mode():
         images = [obs["full_image"]]
-        if cfg.num_images_in_input > 1:
-            images.extend(obs[k] for k in obs if "wrist" in k)
-        images = prepare_images_for_vla(images, cfg)
 
-        prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
-        inputs = processor(prompt, images[0]).to(DEVICE, dtype=torch.bfloat16)
+        if cfg.num_images_in_input > 1:
+            images.extend(
+                obs[key]
+                for key in obs
+                if "wrist" in key
+            )
+
+        images = prepare_images_for_vla(
+            images,
+            cfg,
+        )
+
+        prompt = (
+            f"In: What action should the robot take to "
+            f"{task_label.lower()}?\nOut:"
+        )
+
+        inputs = processor(
+            prompt,
+            images[0],
+        ).to(
+            DEVICE,
+            dtype=torch.bfloat16,
+        )
 
         if len(images) > 1:
             wrist_pixel_values = [
-                processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)["pixel_values"]
+                processor(
+                    prompt,
+                    image,
+                ).to(
+                    DEVICE,
+                    dtype=torch.bfloat16,
+                )["pixel_values"]
                 for image in images[1:]
             ]
+
             inputs["pixel_values"] = torch.cat(
-                [inputs["pixel_values"], *wrist_pixel_values], dim=1
+                [
+                    inputs["pixel_values"],
+                    *wrist_pixel_values,
+                ],
+                dim=1,
             )
 
         proprio = None
+
         if cfg.use_proprio:
-            proprio_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
-            proprio = normalize_proprio(obs["state"], proprio_stats)
+            proprio_stats = (
+                vla.norm_stats[
+                    cfg.unnorm_key
+                ]["proprio"]
+            )
 
-        if not getattr(cfg, "use_dynam_cache", True):
-            action, _ = _predict(inputs, proprio)
-            return [action[i] for i in range(len(action))]
+            proprio = normalize_proprio(
+                obs["state"],
+                proprio_stats,
+            )
 
-        incoming_caches = last_caches if last_caches is not None else {}
-        if cfg.disable_kv_cache_reuse:
-            warped_cache = None
+        use_dynam_cache = bool(
+            cfg.use_dynam_cache
+        )
+
+        incoming_caches = (
+            last_caches
+            if last_caches is not None
+            else {}
+        )
 
         lm_config = vla.language_model.config
         llama_model = vla.language_model.model
-        attention_layer_ids = tuple(
-            int(i) for i in getattr(cfg, "attention_layer_ids", (1,))
-        )
+
+        attention_layer_ids = (1,)
 
         old_state = {
-            "warped_past_key_values": getattr(lm_config, "warped_past_key_values", None),
-            "force_cache_output": getattr(lm_config, "force_cache_output", False),
-            "force_attention_output": getattr(lm_config, "force_attention_output", False),
-            "force_hidden_states_output": getattr(lm_config, "force_hidden_states_output", False),
-            "collect_attn_layers": getattr(lm_config, "collect_attn_layers", None),
+            "warped_past_key_values": getattr(
+                lm_config,
+                "warped_past_key_values",
+                None,
+            ),
+            "force_cache_output": getattr(
+                lm_config,
+                "force_cache_output",
+                False,
+            ),
+            "force_attention_output": getattr(
+                lm_config,
+                "force_attention_output",
+                False,
+            ),
+            "force_hidden_states_output": getattr(
+                lm_config,
+                "force_hidden_states_output",
+                False,
+            ),
+            "collect_attn_layers": getattr(
+                lm_config,
+                "collect_attn_layers",
+                None,
+            ),
         }
 
-        lm_config.warped_past_key_values = warped_cache
-        lm_config.force_cache_output = True
-        lm_config.force_attention_output = True
-        lm_config.force_hidden_states_output = False
-        lm_config.collect_attn_layers = list(attention_layer_ids)
+        if use_dynam_cache:
+            lm_config.warped_past_key_values = (
+                warped_cache
+            )
+            lm_config.force_cache_output = True
+            lm_config.force_attention_output = True
+            lm_config.force_hidden_states_output = False
+            lm_config.collect_attn_layers = list(
+                attention_layer_ids
+            )
+        else:
+            lm_config.warped_past_key_values = None
+            lm_config.force_cache_output = False
+            lm_config.force_attention_output = False
+            lm_config.force_hidden_states_output = False
+            lm_config.collect_attn_layers = None
 
         try:
-            action, _ = _predict(inputs, proprio)
-            new_cache = getattr(llama_model, "last_forward_cache", None)
-            raw_attentions = getattr(llama_model, "last_forward_attentions", None)
-            kept_query_positions = getattr(
-                llama_model, "last_forward_kept_query_positions", None
+            action, _ = _predict(
+                inputs,
+                proprio,
             )
-        finally:
-            for name, value in old_state.items():
-                setattr(lm_config, name, value)
 
-        prev_fixed_ema = incoming_caches.get("ema_fixed_spatial_map")
-        prev_wrist_ema = incoming_caches.get("ema_wrist_spatial_map")
-        prev_ema_step = int(incoming_caches.get("ema_attention_step", 0))
-        cached_content_word_groups = incoming_caches.get("content_word_groups")
-
-        incoming_caches.clear()
-        incoming_caches["past_key_values"] = new_cache
-        incoming_caches["kept_query_positions"] = kept_query_positions
-
-        attns = clean_attentions(raw_attentions)
-        if attns is not None:
-            spatial_layer_ids = [
-                layer_id for layer_id in attention_layer_ids
-                if 0 <= layer_id < len(attns) and attns[layer_id] is not None
-            ]
-            if not spatial_layer_ids:
-                raise RuntimeError(
-                    f"No requested attention layer was collected: {attention_layer_ids}"
+            if use_dynam_cache:
+                new_cache = getattr(
+                    llama_model,
+                    "last_forward_cache",
+                    None,
                 )
 
-            num_patches_per_image = 256
-            fixed_token_start = 1
-            wrist_token_start = fixed_token_start + num_patches_per_image
-            num_image_tokens = num_patches_per_image * int(cfg.num_images_in_input)
-            query_token_start = (
-                fixed_token_start
-                + num_image_tokens
-                + (1 if cfg.use_proprio else 0)
-            )
-
-            attention_kept_positions = kept_query_positions
-            pruning_layers = getattr(lm_config, "progressive_pruning_layers", None)
-            if pruning_layers:
-                progressive_start_layer = min(int(x) for x in pruning_layers)
-                if all(layer_id < progressive_start_layer for layer_id in spatial_layer_ids):
-                    attention_kept_positions = None
-
-            prompt_token_count = int(inputs["input_ids"].shape[1])
-            text_query_end = query_token_start + max(prompt_token_count - 1, 0)
-            mode = str(getattr(cfg, "critical_attention_mode", "mixed"))
-
-            merge_kwargs = dict(
-                multihead_attention=attns,
-                layer_ids=spatial_layer_ids,
-                kept_query_positions=attention_kept_positions,
-                num_key_tokens=num_patches_per_image,
-            )
-
-            if mode == "content_words":
-                word_groups = cached_content_word_groups
-                if word_groups is None:
-                    text_token_ids = inputs["input_ids"][0, 1:prompt_token_count].tolist()
-                    text_token_strs = processor.tokenizer.convert_ids_to_tokens(text_token_ids)
-                    word_groups = get_content_word_row_groups(
-                        text_token_strs=text_token_strs,
-                        text_token_start=query_token_start,
-                    )
-                incoming_caches["content_word_groups"] = word_groups
-                fixed_scores = token_attention_merge_word_groups(
-                    **merge_kwargs,
-                    word_groups=word_groups,
-                    key_token_start=fixed_token_start,
+                raw_attentions = getattr(
+                    llama_model,
+                    "last_forward_attentions",
+                    None,
                 )
-                wrist_scores = token_attention_merge_word_groups(
-                    **merge_kwargs,
-                    word_groups=word_groups,
-                    key_token_start=wrist_token_start,
+
+                kept_query_positions = getattr(
+                    llama_model,
+                    "last_forward_kept_query_positions",
+                    None,
                 )
             else:
-                if mode == "mixed":
-                    q_start, q_end = query_token_start, None
-                elif mode == "text_only":
-                    q_start, q_end = query_token_start, text_query_end
-                elif mode == "status_only":
-                    if not cfg.use_proprio:
-                        raise ValueError("status_only requires cfg.use_proprio=True")
-                    q_start, q_end = query_token_start - 1, query_token_start
-                elif mode == "action_only":
-                    q_start, q_end = text_query_end, None
-                else:
-                    raise ValueError(f"Unknown critical_attention_mode: {mode}")
+                new_cache = None
+                raw_attentions = None
+                kept_query_positions = None
 
-                fixed_scores = token_attention_merge(
-                    **merge_kwargs,
-                    key_token_start=fixed_token_start,
-                    query_token_start=q_start,
-                    query_token_end=q_end,
-                )
-                wrist_scores = token_attention_merge(
-                    **merge_kwargs,
-                    key_token_start=wrist_token_start,
-                    query_token_start=q_start,
-                    query_token_end=q_end,
+        finally:
+            for name, value in old_state.items():
+                setattr(
+                    lm_config,
+                    name,
+                    value,
                 )
 
-            fixed_map = spatial_scores_to_map(fixed_scores, device=DEVICE).detach().cpu()
-            wrist_map = spatial_scores_to_map(wrist_scores, device=DEVICE).detach().cpu()
-            incoming_caches["latest_fixed_spatial_map"] = fixed_map
-            incoming_caches["latest_wrist_spatial_map"] = wrist_map
+        if not use_dynam_cache:
+            incoming_caches.clear()
 
-            if getattr(cfg, "use_attention_ema", False):
-                alpha = float(np.clip(getattr(cfg, "attention_ema_alpha", 0.35), 0.0, 1.0))
-                incoming_caches["ema_fixed_spatial_map"] = (
-                    update_attention_ema(prev_fixed_ema, fixed_map, alpha)
-                    if getattr(cfg, "use_fixed_ema", True)
-                    else fixed_map
-                )
-                incoming_caches["ema_wrist_spatial_map"] = (
-                    update_attention_ema(prev_wrist_ema, wrist_map, alpha)
-                    if getattr(cfg, "use_wrist_ema", True)
-                    else wrist_map
-                )
-                incoming_caches["ema_attention_step"] = prev_ema_step + 1
+            return [
+                action[i]
+                for i in range(len(action))
+            ]
 
-        return [action[i] for i in range(len(action))]
+        prev_wrist_ema = incoming_caches.get(
+            "ema_wrist_spatial_map"
+        )
+
+        content_word_groups = incoming_caches.get(
+            "content_word_groups"
+        )
+
+        incoming_caches.clear()
+
+        incoming_caches["past_key_values"] = (
+            new_cache
+        )
+
+        incoming_caches[
+            "kept_query_positions"
+        ] = kept_query_positions
+
+        attentions = clean_attentions(
+            raw_attentions
+        )
+
+        if attentions is None:
+            return [
+                action[i]
+                for i in range(len(action))
+            ]
+
+        spatial_layer_ids = [
+            layer_id
+            for layer_id in attention_layer_ids
+            if (
+                0 <= layer_id < len(attentions)
+                and attentions[layer_id] is not None
+            )
+        ]
+
+        if not spatial_layer_ids:
+            raise RuntimeError(
+                "No requested attention layer was collected: "
+                f"{attention_layer_ids}"
+            )
+
+        num_patches_per_image = 256
+        fixed_token_start = 1
+        wrist_token_start = (
+            fixed_token_start
+            + num_patches_per_image
+        )
+
+        num_image_tokens = (
+            num_patches_per_image
+            * int(cfg.num_images_in_input)
+        )
+
+        query_token_start = (
+            fixed_token_start
+            + num_image_tokens
+            + (1 if cfg.use_proprio else 0)
+        )
+
+        attention_kept_positions = (
+            kept_query_positions
+        )
+
+        pruning_layers = getattr(
+            lm_config,
+            "progressive_pruning_layers",
+            None,
+        )
+
+        if pruning_layers:
+            progressive_start_layer = min(
+                int(layer)
+                for layer in pruning_layers
+            )
+
+            if all(
+                layer_id < progressive_start_layer
+                for layer_id in spatial_layer_ids
+            ):
+                attention_kept_positions = None
+
+        prompt_token_count = int(
+            inputs["input_ids"].shape[1]
+        )
+
+        if content_word_groups is None:
+            text_token_ids = (
+                inputs["input_ids"][
+                    0,
+                    1:prompt_token_count,
+                ].tolist()
+            )
+
+            text_token_strs = (
+                processor.tokenizer
+                .convert_ids_to_tokens(
+                    text_token_ids
+                )
+            )
+
+            content_word_groups = (
+                get_content_word_row_groups(
+                    text_token_strs=(
+                        text_token_strs
+                    ),
+                    text_token_start=(
+                        query_token_start
+                    ),
+                )
+            )
+
+        incoming_caches[
+            "content_word_groups"
+        ] = content_word_groups
+
+        merge_kwargs = dict(
+            multihead_attention=attentions,
+            layer_ids=spatial_layer_ids,
+            kept_query_positions=(
+                attention_kept_positions
+            ),
+            num_key_tokens=(
+                num_patches_per_image
+            ),
+        )
+
+        fixed_scores = (
+            token_attention_merge_word_groups(
+                **merge_kwargs,
+                word_groups=content_word_groups,
+                key_token_start=(
+                    fixed_token_start
+                ),
+            )
+        )
+
+        wrist_scores = (
+            token_attention_merge_word_groups(
+                **merge_kwargs,
+                word_groups=content_word_groups,
+                key_token_start=(
+                    wrist_token_start
+                ),
+            )
+        )
+
+        fixed_map = spatial_scores_to_map(
+            fixed_scores,
+            device=DEVICE,
+        ).detach().cpu()
+
+        wrist_map = spatial_scores_to_map(
+            wrist_scores,
+            device=DEVICE,
+        ).detach().cpu()
+
+        incoming_caches[
+            "latest_fixed_spatial_map"
+        ] = fixed_map
+
+        incoming_caches[
+            "latest_wrist_spatial_map"
+        ] = wrist_map
+
+        alpha = float(
+            np.clip(
+                0.5,
+                0.0,
+                1.0,
+            )
+        )
+
+        incoming_caches[
+            "ema_wrist_spatial_map"
+        ] = update_attention_ema(
+            prev_wrist_ema,
+            wrist_map,
+            alpha,
+        )
+
+        return [
+            action[i]
+            for i in range(len(action))
+        ]
+
 
 def get_action_from_server(
     observation: Dict[str, Any], server_endpoint: str = "http://0.0.0.0:8777/act"
